@@ -47,6 +47,7 @@ jobs:
           work="$RUNNER_TEMP/elunaro-runtime"
           mkdir -p "$work" 2>/dev/null || { echo "HOST failed download"; exit 1; }
           curl --fail --silent --show-error --max-time 120 \
+            --user-agent "elunaro-runtime/0.1.0" \
             -H "Authorization: Bearer $ELUNARO_RUNTIME_TOKEN" \
             -D "$work/headers" "$ELUNARO_CONTROL_PLANE_URL/api/runtime/code" -o "$work/runtime.tar.gz" \
             2>"$work/download.log" || { echo "HOST failed download"; exit 1; }
