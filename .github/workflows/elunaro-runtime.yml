@@ -1,0 +1,60 @@
+name: Elunaro runtime
+run-name: ${{ inputs.job_id || 'scheduled' }}
+
+"on":
+  schedule:
+    - cron: "5 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Dispatch idempotency key
+        required: false
+        type: string
+      target_workflow:
+        description: Optional validation workflow ID
+        required: false
+        type: string
+
+permissions: {}
+concurrency:
+  group: elunaro-runtime
+  cancel-in-progress: false
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      ELUNARO_CONTROL_PLANE_URL: ${{ secrets.ELUNARO_CONTROL_PLANE_URL }}
+      ELUNARO_RUNTIME_TOKEN: ${{ secrets.ELUNARO_RUNTIME_TOKEN }}
+      ELUNARO_PUBLIC_LOGS: "1"
+      ELUNARO_EXPECTED_HOSTS: "6"
+      ELUNARO_TARGET_WORKFLOW: ${{ inputs.target_workflow }}
+    steps:
+      - name: Run ephemeral runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/elunaro-runtime"
+          mkdir -p "$work"
+          curl --fail --silent --show-error --max-time 120 \
+            -H "Authorization: Bearer $ELUNARO_RUNTIME_TOKEN" \
+            -D "$work/headers" "$ELUNARO_CONTROL_PLANE_URL/api/runtime/code" -o "$work/runtime.tar.gz" \
+            2>"$work/download.log" || { echo "HOST failed"; exit 1; }
+          expected="$(awk 'BEGIN{IGNORECASE=1} /^x-content-sha256:/{gsub("\r",""); print $2}' "$work/headers" | tail -1)"
+          actual="$(sha256sum "$work/runtime.tar.gz" | cut -d' ' -f1)"
+          if [[ ! "$expected" =~ ^[a-f0-9]{64}$ || "$expected" != "$actual" ]]; then echo "HOST failed"; exit 1; fi
+          python3 -c 'import sys,tarfile; f=tarfile.open(sys.argv[1]); f.extractall(sys.argv[2],filter="data"); f.close()' \
+            "$work/runtime.tar.gz" "$work" 2>"$work/extract.log" || { echo "HOST failed"; exit 1; }
+          python3 -m venv "$work/venv" 2>"$work/install.log" || { echo "HOST failed"; exit 1; }
+          "$work/venv/bin/python" -m pip install "$work" >>"$work/install.log" 2>&1 || { echo "HOST failed"; exit 1; }
+          "$work/venv/bin/python" -m elunaro.cli runtime --role agents --expected-hosts "$ELUNARO_EXPECTED_HOSTS" \
+            --max-runtime-seconds 19500 --idle-timeout-seconds 120 &
+          agents=$!
+          "$work/venv/bin/python" -m elunaro.cli runtime --role render --expected-hosts "$ELUNARO_EXPECTED_HOSTS" \
+            --max-runtime-seconds 19500 --idle-timeout-seconds 120 &
+          render=$!
+          failed=0
+          wait "$agents" || failed=1
+          wait "$render" || failed=1
+          if [ "$failed" -ne 0 ]; then echo "HOST failed"; exit 1; fi
