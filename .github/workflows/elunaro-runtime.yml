@@ -24,30 +24,43 @@ jobs:
   runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 345
-    env:
-      ELUNARO_CONTROL_PLANE_URL: ${{ secrets.ELUNARO_CONTROL_PLANE_URL }}
-      ELUNARO_RUNTIME_TOKEN: ${{ secrets.ELUNARO_RUNTIME_TOKEN }}
-      ELUNARO_PUBLIC_LOGS: "1"
-      ELUNARO_EXPECTED_HOSTS: "6"
-      ELUNARO_TARGET_WORKFLOW: ${{ inputs.target_workflow }}
     steps:
+      # actions/setup-python v5.6.0: a26af69be951a213d495a4c3e4e4022e16d87065
+      - name: Set up Python 3.12
+        id: python_setup
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Report Python setup failure
+        if: ${{ failure() && steps.python_setup.outcome == 'failure' }}
+        run: echo "HOST failed venv"
       - name: Run ephemeral runtime
         shell: bash
+        env:
+          ELUNARO_CONTROL_PLANE_URL: ${{ secrets.ELUNARO_CONTROL_PLANE_URL }}
+          ELUNARO_RUNTIME_TOKEN: ${{ secrets.ELUNARO_RUNTIME_TOKEN }}
+          ELUNARO_PUBLIC_LOGS: "1"
+          ELUNARO_EXPECTED_HOSTS: "6"
+          ELUNARO_TARGET_WORKFLOW: ${{ inputs.target_workflow }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/elunaro-runtime"
-          mkdir -p "$work"
+          mkdir -p "$work" 2>/dev/null || { echo "HOST failed download"; exit 1; }
           curl --fail --silent --show-error --max-time 120 \
             -H "Authorization: Bearer $ELUNARO_RUNTIME_TOKEN" \
             -D "$work/headers" "$ELUNARO_CONTROL_PLANE_URL/api/runtime/code" -o "$work/runtime.tar.gz" \
-            2>"$work/download.log" || { echo "HOST failed"; exit 1; }
-          expected="$(awk 'BEGIN{IGNORECASE=1} /^x-content-sha256:/{gsub("\r",""); print $2}' "$work/headers" | tail -1)"
-          actual="$(sha256sum "$work/runtime.tar.gz" | cut -d' ' -f1)"
-          if [[ ! "$expected" =~ ^[a-f0-9]{64}$ || "$expected" != "$actual" ]]; then echo "HOST failed"; exit 1; fi
+            2>"$work/download.log" || { echo "HOST failed download"; exit 1; }
+          expected="$(awk 'tolower($1)=="x-content-sha256:"{gsub("\r",""); print $2}' "$work/headers" 2>/dev/null | tail -1)" \
+            || { echo "HOST failed checksum"; exit 1; }
+          actual="$(sha256sum "$work/runtime.tar.gz" 2>/dev/null | cut -d' ' -f1)" \
+            || { echo "HOST failed checksum"; exit 1; }
+          if [[ ! "$expected" =~ ^[a-f0-9]{64}$ || "$expected" != "$actual" ]]; then echo "HOST failed checksum"; exit 1; fi
           python3 -c 'import sys,tarfile; f=tarfile.open(sys.argv[1]); f.extractall(sys.argv[2],filter="data"); f.close()' \
-            "$work/runtime.tar.gz" "$work" 2>"$work/extract.log" || { echo "HOST failed"; exit 1; }
-          python3 -m venv "$work/venv" 2>"$work/install.log" || { echo "HOST failed"; exit 1; }
-          "$work/venv/bin/python" -m pip install "$work" >>"$work/install.log" 2>&1 || { echo "HOST failed"; exit 1; }
+            "$work/runtime.tar.gz" "$work" 2>"$work/extract.log" || { echo "HOST failed extract"; exit 1; }
+          python3 -c 'import sys; sys.exit(sys.version_info[:2] != (3,12))' 2>"$work/venv.log" \
+            || { echo "HOST failed venv"; exit 1; }
+          python3 -m venv "$work/venv" 2>"$work/venv.log" || { echo "HOST failed venv"; exit 1; }
+          "$work/venv/bin/python" -m pip install "$work" >"$work/install.log" 2>&1 || { echo "HOST failed install"; exit 1; }
           "$work/venv/bin/python" -m elunaro.cli runtime --role agents --expected-hosts "$ELUNARO_EXPECTED_HOSTS" \
             --max-runtime-seconds 19500 --idle-timeout-seconds 120 &
           agents=$!
@@ -57,4 +70,4 @@ jobs:
           failed=0
           wait "$agents" || failed=1
           wait "$render" || failed=1
-          if [ "$failed" -ne 0 ]; then echo "HOST failed"; exit 1; fi
+          if [ "$failed" -ne 0 ]; then echo "HOST failed runtime"; exit 1; fi
